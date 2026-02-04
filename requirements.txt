@@ -1,0 +1,7 @@
+streamlit
+pandas
+altair
+playwright
+trafilatura
+beautifulsoup4
+python-dotenv
