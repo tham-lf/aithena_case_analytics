@@ -1,6 +1,9 @@
 import streamlit as st
 import pandas as pd
 import sqlite3
+import altair as alt
+import asyncio
+from pipeline import process_case
 import src.database as db
 
 st.set_page_config(
@@ -29,6 +32,46 @@ def load_dashboard_data(db_name: str = "data/cases.db"):
 
 st.title("⚖️ Singapore Court Case Analytics")
 st.caption("Data source: LawNet OpenLaw (Scraped locally)")
+
+# --- Sidebar Scraper UI (Always Visible) ---
+with st.sidebar.expander("Add New Cases (Scraper)", expanded=False):
+    urls_input = st.text_area("Paste LawNet URLs (one per line)", height=150)
+    if st.button("Scrape Cases"):
+        if urls_input:
+            urls = [u.strip() for u in urls_input.split('\\n') if u.strip()]
+            if urls:
+                progress_bar = st.progress(0)
+                status_text = st.empty()
+                
+                async def run_scraper(urls):
+                    for i, url in enumerate(urls):
+                        status_text.text(f"Scraping {i+1}/{len(urls)}: {url}...")
+                        # Call the existing pipeline logic
+                        await process_case(url, db_name="data/cases.db")
+                        progress_bar.progress((i + 1) / len(urls))
+                    status_text.success("Scraping completed!")
+                    await asyncio.sleep(1) # Brief pause to show success
+                
+                # Run the async loop
+                try:
+                    loop = asyncio.get_event_loop()
+                except RuntimeError:
+                    loop = asyncio.new_event_loop()
+                    asyncio.set_event_loop(loop)
+                
+                # Streamlit runs in a separate thread usually, but asyncio.run might conflict with existing loop?
+                # Safer to use new event loop policy or just try run
+                # Given app.py imports asyncio, let's stick to simple run or loop management
+                import nest_asyncio
+                nest_asyncio.apply()
+                asyncio.run(run_scraper(urls))
+                
+                st.rerun() # Refresh data
+            else:
+                st.warning("No valid URLs found.")
+        else:
+            st.warning("Please paste at least one URL.")
+# -------------------------------------------
 
 try:
     df = load_data()
@@ -74,9 +117,9 @@ try:
         st.title("Singapore Court Case Analytics")
         
         # --- Analytics Tabs ---
-        tab0, tab1, tab2 = st.tabs(["📊 Research Dashboard", "📈 Cluster Analytics", "📄 Single Case View"])
+        tab0, tab1, tab2, tab3 = st.tabs(["📊 Research Dashboard", "📈 Cluster Analytics", "📄 Single Case View", "🔌 API Documentation"])
 
-        # --- TAB 0: Research Dashboard ---
+        # --- TAB 0: Research Dashboard---
         with tab0:
             st.markdown("### Overview")
             
@@ -125,9 +168,27 @@ try:
                 if not df.empty and all_areas:
                     # Parse all areas properly
                     all_areas_series = pd.Series(all_areas)
-                    cat_counts = all_areas_series.value_counts().head(5)
+                    cat_counts = all_areas_series.value_counts().head(5).reset_index()
+                    cat_counts.columns = ["Category", "Count"]
+                    
                     if not cat_counts.empty:
-                        st.bar_chart(cat_counts)
+                        # Horizontal Bar Chart - Blue
+                        chart = alt.Chart(cat_counts).mark_bar(color="#0084ff", cornerRadiusEnd=3).encode(
+                            x=alt.X("Count", title=None),
+                            y=alt.Y("Category", sort="-x", title=None),
+                            tooltip=["Category", "Count"]
+                        ).properties(height=300)
+                        
+                        # Add text labels
+                        text = chart.mark_text(
+                            align='left',
+                            baseline='middle',
+                            dx=3
+                        ).encode(
+                            text='Count'
+                        )
+                        
+                        st.altair_chart(chart + text, use_container_width=True)
                     else:
                         st.info("No category data.")
                 else:
@@ -137,7 +198,26 @@ try:
                 st.subheader("Recent Query Topics")
                 st.caption("Most common research topics in the last 30 days.")
                 if not top_queries.empty:
-                    st.bar_chart(top_queries)
+                    # Reset index to get Topic column back
+                    queries_df = top_queries.reset_index()
+                    
+                    # Horizontal Bar Chart - Grey
+                    chart = alt.Chart(queries_df).mark_bar(color="#6c757d", cornerRadiusEnd=3).encode(
+                        x=alt.X("Count", title=None),
+                        y=alt.Y("Topic", sort="-x", title=None),
+                        tooltip=["Topic", "Count"]
+                    ).properties(height=300)
+
+                    # Add text labels
+                    text = chart.mark_text(
+                        align='left',
+                        baseline='middle',
+                        dx=3
+                    ).encode(
+                        text='Count'
+                    )
+
+                    st.altair_chart(chart + text, use_container_width=True)
                 else:
                     st.info("No queries yet.")
 
@@ -236,6 +316,92 @@ try:
             else:
                 st.warning("No cases available to inspect.")
 
-except sqlite3.OperationalError:
-    st.error("Database not found! Please run the pipeline script first to generate `cases.db`.")
+        # --- TAB 3: API Documentation ---
+        with tab3:
+            st.markdown("## System API Reference")
+            st.caption("The application exposes a REST API via `FastAPI` in `api.py`. You can use this to integrate with other systems.")
+            
+            st.info("To start the API server, run: `uvicorn api:app --reload` in your terminal.")
+            
+            st.divider()
 
+            st.info("""
+            **Architecture Note**: 
+            - **Data**: Stored in **Supabase** (Cloud).
+            - **API Server**: Currently running **locally** (`localhost`). 
+            If you deploy this app (e.g. to Vercel/Render), update the Base URL below.
+            """)
+            
+            base_url = st.text_input("API Base URL", value="http://localhost:8000")
+            
+            # --- Endpoint 1: GET /cases ---
+            st.subheader("1. List Cases")
+            st.markdown("`GET /cases`")
+            st.markdown("Retrieves a paginated list of analyzed cases from the database.")
+            
+            with st.expander("Usage Example"):
+                tab_curl, tab_py = st.tabs(["cURL", "Python"])
+                
+                with tab_curl:
+                    st.code(f"""
+curl -X 'GET' \\
+  '{base_url}/cases?limit=10&offset=0' \\
+  -H 'accept: application/json'
+                    """, language="bash")
+                    
+                with tab_py:
+                    st.code(f"""
+import requests
+
+response = requests.get("{base_url}/cases", params={{"limit": 10}})
+print(response.json())
+                    """, language="python")
+
+            # --- Endpoint 2: POST /cases/scrape ---
+            st.divider()
+            st.subheader("2. Trigger Scraper")
+            st.markdown("`POST /cases/scrape`")
+            st.markdown("Triggers a background job to scrape and process a list of LawNet URLs.")
+            
+            with st.expander("Usage Example"):
+                tab_curl, tab_py = st.tabs(["cURL", "Python"])
+                
+                with tab_curl:
+                    st.code(f"""
+curl -X 'POST' \\
+  '{base_url}/cases/scrape' \\
+  -H 'Content-Type: application/json' \\
+  -d '{{
+  "urls": [
+    "https://www.lawnet.com/openlaw/cases/citation/[2026]+SGHC+27?ref=sg-sc"
+  ],
+  "force": true
+}}'
+                    """, language="bash")
+                    
+                with tab_py:
+                    st.code(f"""
+import requests
+
+payload = {{
+    "urls": ["https://www.lawnet.com/openlaw/cases/citation/[2026]+SGHC+27?ref=sg-sc"],
+    "force": True
+}}
+response = requests.post("{base_url}/cases/scrape", json=payload)
+print(response.json())
+                    """, language="python")
+
+            # --- Endpoint 3: Health Check ---
+            st.divider()
+            st.subheader("3. Health Check")
+            st.markdown("`GET /`")
+            st.markdown("Simple health check to verify API status.")
+            st.code('curl -X GET "http://localhost:8000/"', language="bash")
+
+            st.divider()
+            st.markdown("### Interactive Documentation")
+            st.markdown("Once the API is running, visit `http://localhost:8000/docs` for the interactive Swagger UI.")
+
+except Exception as e:
+    st.error(f"Database Error: {e}")
+    st.info("Check your `.env` configuration or run `python seed_cases.py` (if local) to initialize.")
