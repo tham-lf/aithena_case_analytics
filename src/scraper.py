@@ -13,9 +13,25 @@ load_dotenv() # Load environment variables from .env file
 
 logger = logging.getLogger(__name__)
 
+import logging
+import asyncio
+from playwright.async_api import async_playwright
+import trafilatura
+from bs4 import BeautifulSoup
+import re
+import os
+import json
+from typing import Dict, Any, Optional
+from dotenv import load_dotenv
+
+load_dotenv() # Load environment variables from .env file
+
+logger = logging.getLogger(__name__)
+
 async def fetch_case_html(url: str, headless: bool = True) -> str:
     """
     Fetches the HTML content of a LawNet case URL using Playwright.
+    Robustly waits for dynamic content to load.
     """
     logger.info(f"Fetching URL: {url}")
     
@@ -26,13 +42,15 @@ async def fetch_case_html(url: str, headless: bool = True) -> str:
             
             await page.goto(url)
             
-            # Wait for dynamic content
+            # Wait for specific LawNet content indicators
             try:
-                await page.wait_for_load_state('networkidle', timeout=10000)
-            except Exception as e:
-                logger.warning(f"Network idle timeout: {e}. Proceeding.")
-            
-            # Extra wait for binding
+                # 'lr_judgments' seems to be a main section wrapper based on debug
+                # Or wait for "Decision Date" label if class names change
+                await page.wait_for_selector(".lr_judgments", timeout=15000)
+            except Exception:
+                logger.warning("Timeout waiting for .lr_judgments. Content might be partial.")
+
+            # Extra safety wait for text rendering
             await page.wait_for_timeout(2000)
             
             content = await page.content()
@@ -45,104 +63,96 @@ async def fetch_case_html(url: str, headless: bool = True) -> str:
 
 def extract_case_metadata(html_content: str) -> dict:
     """
-    Extracts metadata (Case Name, Citation, Date, Coram) directly from HTML 
-    using BeautifulSoup. This serves as a robust fallback/primary source vs LLM.
+    Extracts metadata from LawNet HTML using reverse-engineered class names.
     """
     soup = BeautifulSoup(html_content, 'html.parser')
     data = {}
     
-    # 1. Case Title
-    title_tag = soup.find('h1') or soup.find(class_='caseTitle') or soup.find(class_='title')
-    data['case_name'] = title_tag.get_text(strip=True) if title_tag else None
-    
-    # Infer Parties from Case Name
-    if data['case_name'] and " v " in data['case_name']:
+    # helper to find value by label
+    def get_meta_value(label_pattern):
+        # Find the label cell
+        label_div = soup.find("div", class_="lr_detail_col_left", string=re.compile(label_pattern, re.IGNORECASE))
+        if label_div:
+            # Find sibling value cell
+            value_div = label_div.find_next_sibling("div", class_="lr_detail-col-right")
+            if value_div:
+                return value_div.get_text(" ", strip=True)
+        return None
+
+    # 1. Case Title & Citation
+    # Robust fallback: Regex for data-page-title since BS4 might miss it in some parsers
+    # Use DOTALL to catch multi-line attributes
+    title_match = re.search(r'data-page-title=["\']([^"\']+)["\']', html_content, re.DOTALL | re.IGNORECASE)
+    if title_match:
+        data['case_name'] = title_match.group(1).strip()
+    else:
+        # Fallback to H1 or standard classes
+        # Try finding the citation header which often contains the name
+        title_tag = soup.find('h1') or soup.find(class_='caseTitle') or soup.find(class_='title')
+        data['case_name'] = title_tag.get_text(strip=True) if title_tag else "Unknown Case"
+
+    # Infer Parties
+    if data.get('case_name') and " v " in data['case_name']:
         parts = data['case_name'].split(" v ", 1)
         data['plaintiff_name'] = parts[0].strip()
         data['defendant_name'] = parts[1].strip()
     else:
         data['plaintiff_name'] = None
         data['defendant_name'] = None
-    
+
     # 2. Citation
     text = soup.get_text(" ", strip=True)
     citation_match = re.search(r'\[\d{4}\]\s+[A-Z]+\s+\d+', text)
-    data['citation'] = citation_match.group(0) if citation_match else None
+    data['citation'] = citation_match.group(0) if citation_match else "Unknown Citation"
     
     # 3. Decision Date
-    date_label = soup.find(string=re.compile("Decision Date", re.IGNORECASE))
-    if date_label:
-        next_elem = date_label.find_next()
-        data['decision_date'] = next_elem.get_text(strip=True) if next_elem else date_label.parent.get_text(strip=True)
-    else:
-        # Fallback: try looking for date-like pattern near start
-        pass 
-    if not data.get('decision_date'):
-        data['decision_date'] = None
+    data['decision_date'] = get_meta_value("Decision Date")
 
-    # 4. Coram
-    coram_match = re.search(r"Coram\s+(.*?)(?=\s+(?:Counsel|Parties|Judgment|Introduction|\[))", text, re.IGNORECASE | re.DOTALL)
-    if coram_match:
-        data['judge_name'] = coram_match.group(1).strip()
-    else:
-        coram_label = soup.find(string=re.compile("Coram|Before", re.IGNORECASE))
-        data['judge_name'] = coram_label.find_next().get_text(strip=True) if coram_label else None
+    # 4. Coram (Judge)
+    data['judge_name'] = get_meta_value("Coram")
 
-    # 5. Counsel Extraction
-    counsel_block = soup.find(string=re.compile("Representation|Counsel", re.IGNORECASE))
-    
-    # Look for the block following "Representation" or "Counsel"
-    if counsel_block:
-        counsel_text = counsel_block.find_next().get_text(" ", strip=True) if counsel_block.find_next() else counsel_block.parent.get_text(" ", strip=True)
-        # Naive split for plaintiff/defendant if possible, or just dump all
-        data['plaintiff_counsel'] = _extract_party_counsel_html(counsel_text, r"plaintiff|appellant|claimant")
+    # 5. Counsel
+    counsel_text = get_meta_value("Counsel Name")
+    if counsel_text:
+        data['plaintiff_counsel'] = _extract_party_counsel_html(counsel_text, r"plaintiff|appellant|claimant|applicant")
         data['defendant_counsel'] = _extract_party_counsel_html(counsel_text, r"defendant|respondent")
     else:
         data['plaintiff_counsel'] = None
         data['defendant_counsel'] = None
 
     # 6. Area of Law
-    # Priority: "Legal Topics" section with class 'lr_cw' > "Legal Topics" text block > "Catchwords"
-    
-    # Method A: Specific Class Extraction (most robust for LawNet)
-    # The topics are often in spans with class 'lr_cw' inside a container
-    # We try to find the "Legal Topics" header first to ensure we are in the right section
-    legal_topics_header = soup.find(string=re.compile("Legal Topics", re.IGNORECASE))
+    # "Legal Topics" is in div.lr_heading_text. The content should be in a sibling or cousin container.
+    # We search for the specific header div.
+    legal_topics_header = soup.find("div", class_="lr_heading_text", string=re.compile("Legal Topics", re.IGNORECASE))
     
     if legal_topics_header:
-        # Try to find the container div 'lr_sec_content' nearby
+        # Debug structure suggests:
+        # <div class="lr_heading_text">Legal Topics</div>
+        # <div class="lr_sec_content">...</div> (sibling?)
+        # Let's traverse to the next "lr_sec_content"
         container = legal_topics_header.find_next(class_="lr_sec_content")
-        
         if container:
-            # Extract individual topic terms
             cw_spans = container.find_all(class_="lr_cw")
             if cw_spans:
-                # Group them? They are linear spans. "Contract", "Breach", "Damages"...
-                # We can join them with ' > ' if they are siblings, or just list them.
-                # However, visual hierarchy (Contract > Breach) might be lost in linear spans.
-                # But a simple join is better than nothing.
                 topics = [s.get_text(strip=True) for s in cw_spans]
-                # Cleanup duplicates if any
                 seen = set()
                 deduped = [x for x in topics if not (x in seen or seen.add(x))]
-                data['area_of_law'] = "; ".join(deduped[:10]) # Take top 10 keywords
+                data['area_of_law'] = "; ".join(deduped[:10])
             else:
-                # Fallback: just text
                 data['area_of_law'] = container.get_text(" ", strip=True)[:200]
         else:
-             # Fallback to traversing siblings if class not found
-             current_elem = legal_topics_header.find_next()
-             topics = []
-             for _ in range(5):
-                if not current_elem: break
-                text = current_elem.get_text(strip=True)
-                if "Judgments" in text or "Case Details" in text: break
-                if text and len(text) > 2: topics.append(text)
-                current_elem = current_elem.find_next()
-             
-             data['area_of_law'] = "; ".join(topics) if topics else "Unclassified"
+             # Try parent's sibling
+             parent = legal_topics_header.find_parent()
+             if parent:
+                 sibling = parent.find_next_sibling()
+                 if sibling:
+                     data['area_of_law'] = sibling.get_text(" ", strip=True)[:200]
+                 else:
+                     data['area_of_law'] = "Unclassified"
+             else:
+                 data['area_of_law'] = "Unclassified"
     else:
-        # Method B: Fallback to Catchwords
+        # Fallback to Catchwords
         catchwords = soup.find(string=re.compile("Catchwords", re.IGNORECASE))
         if catchwords:
             # Often a list following it
@@ -151,42 +161,37 @@ def extract_case_metadata(html_content: str) -> dict:
         else:
             data['area_of_law'] = "Unclassified"
 
-    # 7. Outcome (Heuristic from HTML)
-    # Check for "Outcome" or "Judgment" header at end? Hard to do in HTML.
-    # We'll leave outcome to key word search in full text or LLM.
-    # But let's check for "Appeal dismissed" type phrases in the first few paragraphs (Headnote).
-    headnote = soup.find(class_='headnote')
-    if headnote:
-        hn_text = headnote.get_text().lower()
-        if "dismissed" in hn_text:
-            data['outcome'] = "Dismissed"
-        elif "allowed" in hn_text:
-            data['outcome'] = "Allowed"
-        else:
-            data['outcome'] = None
-    else:
-        data['outcome'] = None
+    # 7. Outcome
+    data['outcome'] = None 
 
     return data
 
 def _extract_party_counsel_html(text: str, role_regex: str) -> str:
     """
     Simple helper to extract name before a role pattern.
-    Defaulting to just returning the whole chunk if complex string parsing is needed,
-    but let's try a split.
     """
-    # E.g. "Mr X (Firm A) for the Plaintiff; Ms Y (Firm B) for the Defendant"
-    # We want X if we pass 'plaintiff'.
     try:
-        # Split by semicolon to separate parties
-        parts = re.split(r'[;.]', text)
-        found_names = []
+        # The snippet showed spans with class 'bullet-separator'. 
+        # If the input text already merged them, we might see "Name (Firm) for the plaintiff Name (Firm) for..."
+        # We can try splitting by known role keywords if they are present.
+        
+        matches = []
+        # Regex to find "X for the Y" pattern
+        # This is tricky without the structured span splitting.
+        # But let's try a best effort on the text block.
+        
+        # Split by typical separators if present in text dump
+        parts = re.split(r'(?<=\))\s+(?=[A-Z])', text) # Split after closing bracket if followed by Capital (Name)
+        if len(parts) == 1:
+            parts = text.split(";")
+            
         for p in parts:
             if re.search(role_regex, p, re.IGNORECASE):
-                # Remove the role part like " for the Plaintiff"
-                clean_name = re.sub(r"(for|appearing)?\s*(the)?\s*(" + role_regex + r").*", "", p, flags=re.IGNORECASE).strip()
-                found_names.append(clean_name)
-        return "; ".join(found_names) if found_names else None
+                # Clean up " for the Plaintiff" suffix
+                clean = re.sub(r"\s+(appearing|for)\s+(the)?\s*(" + role_regex + r").*", "", p, flags=re.IGNORECASE).strip()
+                matches.append(clean)
+                
+        return "; ".join(matches) if matches else None
     except:
         return None
 

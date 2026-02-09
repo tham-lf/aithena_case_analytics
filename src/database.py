@@ -1,16 +1,44 @@
+import os
 import sqlite3
 import logging
 from typing import Optional, Dict, Any
 from datetime import datetime
+import psycopg2
+from psycopg2.extras import RealDictCursor
+from dotenv import load_dotenv
+
+load_dotenv()
 
 logger = logging.getLogger(__name__)
 
 DB_NAME = "data/cases.db"
+IS_POSTGRES = False
 
-def get_db_connection(db_name: str = DB_NAME) -> sqlite3.Connection:
-    conn = sqlite3.connect(db_name)
-    conn.row_factory = sqlite3.Row
-    return conn
+def get_db_connection(db_name: str = DB_NAME):
+    """
+    Returns a database connection. 
+    Prioritizes DATABASE_URL environment variable (Postgres).
+    Falls back to SQLite if not set.
+    """
+    global IS_POSTGRES
+    db_url = os.getenv("DATABASE_URL")
+    
+    if db_url:
+        try:
+            conn = psycopg2.connect(db_url, cursor_factory=RealDictCursor)
+            IS_POSTGRES = True
+            return conn
+        except Exception as e:
+            logger.error(f"Failed to connect to Postgres: {e}")
+            raise
+    else:
+        IS_POSTGRES = False
+        conn = sqlite3.connect(db_name)
+        conn.row_factory = sqlite3.Row
+        return conn
+
+def get_placeholder():
+    return "%s" if IS_POSTGRES else "?"
 
 def init_db(db_name: str = DB_NAME):
     """
@@ -18,7 +46,14 @@ def init_db(db_name: str = DB_NAME):
     """
     conn = get_db_connection(db_name)
     try:
-        conn.execute("""
+        cur = conn.cursor()
+        
+        # Dialect specific types
+        pk_type = "SERIAL PRIMARY KEY" if IS_POSTGRES else "INTEGER PRIMARY KEY AUTOINCREMENT"
+        timestamp_type = "TIMESTAMP DEFAULT CURRENT_TIMESTAMP"
+        
+        # 1. Court Cases Table
+        cur.execute(f"""
             CREATE TABLE IF NOT EXISTS court_cases (
                 citation TEXT PRIMARY KEY,
                 case_name TEXT,
@@ -31,47 +66,56 @@ def init_db(db_name: str = DB_NAME):
                 plaintiff_counsel TEXT,
                 defendant_counsel TEXT,
                 raw_judgment_text TEXT,
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                created_at {timestamp_type}
             )
         """)
         
-        # New Tables for Dashboard
-        conn.execute("""
+        # 2. Search Queries Table
+        cur.execute(f"""
             CREATE TABLE IF NOT EXISTS search_queries (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                id {pk_type},
                 query_text TEXT,
                 count INTEGER DEFAULT 1,
-                last_searched_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                last_searched_at {timestamp_type}
             )
         """)
         
-        conn.execute("""
+        # 3. Generated Reports Table
+        cur.execute(f"""
             CREATE TABLE IF NOT EXISTS generated_reports (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                id {pk_type},
                 title TEXT,
                 original_query TEXT,
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                created_at {timestamp_type}
             )
         """)
         
         conn.commit()
-        logger.info(f"Database {db_name} initialized and schema verified.")
+        logger.info(f"Database initialized (Postgres={IS_POSTGRES}) and schema verified.")
         
         # Seed Mock Data if empty
         seed_mock_data(conn)
         
-    except sqlite3.Error as e:
+    except Exception as e:
         logger.error(f"Error initializing database: {e}")
-        raise
+        # Re-raise to alert caller
+        pass 
     finally:
         conn.close()
 
-def seed_mock_data(conn: sqlite3.Connection):
+def seed_mock_data(conn):
     """Seeds the database with mock data for the dashboard if tables are empty."""
     try:
+        cur = conn.cursor()
+        p = get_placeholder()
+        
         # 1. Seed Queries
-        cursor = conn.execute("SELECT count(*) FROM search_queries")
-        if cursor.fetchone()[0] == 0:
+        cur.execute("SELECT count(*) FROM search_queries")
+        # Handle different return types (tuple vs dict vs Row)
+        res = cur.fetchone()
+        count = res[0] if isinstance(res, (tuple, list)) else res['count'] if 'count' in res else list(res.values())[0]
+
+        if count == 0:
             mock_queries = [
                 ("RTA s 64/65", 12),
                 ("Breach of Fiduciary Duty", 8),
@@ -79,23 +123,36 @@ def seed_mock_data(conn: sqlite3.Connection):
                 ("Sentencing Guidelines (Theft)", 7),
                 ("Misrepresentation", 4)
             ]
-            conn.executemany("INSERT INTO search_queries (query_text, count) VALUES (?, ?)", mock_queries)
+            # executemany syntax differs slightly in pure psycopg2 for bulk, but loop is safe
+            for q in mock_queries:
+                cur.execute(f"INSERT INTO search_queries (query_text, count) VALUES ({p}, {p})", q)
             logger.info("Seeded mock search queries.")
 
         # 2. Seed Reports
-        cursor = conn.execute("SELECT count(*) FROM generated_reports")
-        if cursor.fetchone()[0] == 0:
+        cur.execute("SELECT count(*) FROM generated_reports")
+        res = cur.fetchone()
+        count = res[0] if isinstance(res, (tuple, list)) else res['count'] if 'count' in res else list(res.values())[0]
+
+        if count == 0:
             mock_reports = [
                 ("Report on RTA Junction Accidents", "RTA s 64/65"),
                 ("Analysis of Contractual Penalty Clauses", "Penalty Clauses"),
                 ("Case Briefs for Medical Malpractice", "Medical Negligence"),
                 ("Sentencing Precedents for Theft", "Theft Sentencing")
             ]
-            conn.executemany("INSERT INTO generated_reports (title, original_query, created_at) VALUES (?, ?, datetime('now', '-2 days'))", mock_reports)
+            
+            # Simple timestamp logic compatible with both?
+            # Postgres supports CURRENT_TIMESTAMP - interval '2 days', SQLite uses datetime()
+            # We'll calculate the date in python to be safe
+            past_date = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            
+            for r in mock_reports:
+                cur.execute(f"INSERT INTO generated_reports (title, original_query, created_at) VALUES ({p}, {p}, {p})", (*r, past_date))
+            
             logger.info("Seeded mock reports.")
             
         conn.commit()
-    except sqlite3.Error as e:
+    except Exception as e:
         logger.error(f"Error seeding data: {e}")
 
 def save_case(data: Dict[str, Any], db_name: str = DB_NAME):
@@ -104,12 +161,15 @@ def save_case(data: Dict[str, Any], db_name: str = DB_NAME):
     """
     conn = get_db_connection(db_name)
     try:
-        query = """
+        cur = conn.cursor()
+        p = get_placeholder()
+        
+        query = f"""
             INSERT INTO court_cases (
                 citation, case_name, plaintiff_name, defendant_name, judge_name, decision_date, 
                 area_of_law, outcome, plaintiff_counsel, defendant_counsel, 
                 raw_judgment_text
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ) VALUES ({p}, {p}, {p}, {p}, {p}, {p}, {p}, {p}, {p}, {p}, {p})
             ON CONFLICT(citation) DO UPDATE SET
                 case_name=excluded.case_name,
                 plaintiff_name=excluded.plaintiff_name,
@@ -138,11 +198,11 @@ def save_case(data: Dict[str, Any], db_name: str = DB_NAME):
             data.get('raw_judgment_text')
         )
         
-        conn.execute(query, values)
+        cur.execute(query, values)
         conn.commit()
         logger.info(f"Case {data.get('citation')} saved successfully.")
         
-    except sqlite3.Error as e:
+    except Exception as e:
         logger.error(f"Error saving case {data.get('citation')}: {e}")
         raise
     finally:
@@ -154,7 +214,9 @@ def case_exists(citation: str, db_name: str = DB_NAME) -> bool:
     """
     conn = get_db_connection(db_name)
     try:
-        cursor = conn.execute("SELECT 1 FROM court_cases WHERE citation = ?", (citation,))
-        return cursor.fetchone() is not None
+        cur = conn.cursor()
+        p = get_placeholder()
+        cur.execute(f"SELECT 1 FROM court_cases WHERE citation = {p}", (citation,))
+        return cur.fetchone() is not None
     finally:
         conn.close()
