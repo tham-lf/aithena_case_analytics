@@ -2,6 +2,8 @@ import asyncio
 import argparse
 import logging
 import re
+import json
+import os
 from typing import List
 
 from src.scraper import fetch_case_html, extract_judgment_text, extract_case_metadata
@@ -29,14 +31,14 @@ def extract_citation_from_url(url: str) -> str:
         pass
     return url # Fallback to URL as ID if extraction fails
 
-async def process_case(url: str, db_name: str, force: bool = False):
+async def process_case(url: str, db_name: str = None, force: bool = False, jsonl_path: str = "data/case_data.jsonl"):
     """
     Orchestrates the processing of a single case.
     """
     citation = extract_citation_from_url(url)
     
     # 1. Idempotency Check
-    if not force and db.case_exists(citation, db_name=db_name):
+    if not force and db_name and db.case_exists(citation, db_name=db_name):
         logger.info(f"Skipping {citation} - already exists in DB.")
         return
 
@@ -86,24 +88,35 @@ async def process_case(url: str, db_name: str, force: bool = False):
         **final_metadata # Unpack fields including counsel
     }
     
-    db.save_case(case_data, db_name=db_name)
-    logger.info(f"Successfully processed {citation}")
+    if db_name:
+        db.save_case(case_data, db_name=db_name)
+        logger.info(f"Successfully saved {citation} to DB")
+        
+    if jsonl_path:
+        with open(jsonl_path, mode='a', encoding='utf-8') as f:
+            f.write(json.dumps(case_data, ensure_ascii=False) + '\n')
+        logger.info(f"Successfully saved {citation} to JSONL")
 
 async def main():
     parser = argparse.ArgumentParser(description="LawNet Case Processing Pipeline")
     parser.add_argument("urls", nargs='+', help="List of URLs to process")
     parser.add_argument("--force", action="store_true", help="Reprocess even if exists")
-    parser.add_argument("--db", default="data/cases.db", help="Database file path")
+    parser.add_argument("--db", default=None, help="Database file path")
+    parser.add_argument("--jsonl", default="data/case_data.jsonl", help="Path to output JSONL file")
+    parser.add_argument("--no-db", action="store_true", help="Do not save to database (deprecated, default behavior)")
     
     args = parser.parse_args()
     
+    db_name = None if args.no_db else args.db
+    
     # Init DB
-    db.init_db(args.db)
+    if db_name:
+        db.init_db(db_name)
     
     # Process Cases
     tasks = []
     for url in args.urls:
-        tasks.append(process_case(url, args.db, force=args.force))
+        tasks.append(process_case(url, db_name=db_name, force=args.force, jsonl_path=args.jsonl))
         
     # Run concurrently
     await asyncio.gather(*tasks)

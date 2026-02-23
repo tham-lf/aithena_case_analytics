@@ -1,17 +1,3 @@
-import logging
-import asyncio
-from playwright.async_api import async_playwright
-import trafilatura
-from bs4 import BeautifulSoup
-import re
-import os
-import json
-from typing import Dict, Any, Optional
-from dotenv import load_dotenv
-
-load_dotenv() # Load environment variables from .env file
-
-logger = logging.getLogger(__name__)
 
 import logging
 import asyncio
