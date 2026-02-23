@@ -1,10 +1,10 @@
 import streamlit as st
 import pandas as pd
-import sqlite3
+import json
+import os
 import altair as alt
-import asyncio
-from pipeline import process_case
-import src.database as db
+import subprocess
+import sys
 
 st.set_page_config(
     page_title="Singapore Court Case Analytics",
@@ -12,23 +12,37 @@ st.set_page_config(
     layout="wide"
 )
 
-def load_data(db_name: str = "data/cases.db"):
-    conn = db.get_db_connection(db_name)
-    df = pd.read_sql_query("SELECT * FROM court_cases", conn)
-    conn.close()
-    return df
-def load_dashboard_data(db_name: str = "data/cases.db"):
-    conn = db.get_db_connection(db_name)
-    queries = pd.read_sql_query("SELECT query_text as Topic, count as Count FROM search_queries ORDER BY count DESC LIMIT 5", conn)
-    reports = pd.read_sql_query("SELECT title as 'Report Title', original_query as 'Original Query', created_at as 'Date Created' FROM generated_reports ORDER BY created_at DESC LIMIT 5", conn)
-    reports["Actions"] = "View & Export" # Add static link for now
+def load_data(jsonl_path: str = "data/case_data.jsonl"):
+    if not os.path.exists(jsonl_path):
+        return pd.DataFrame()
     
-    # Get recent query count
-    recent_query_count = conn.execute("SELECT sum(count) FROM search_queries").fetchone()[0] or 0
-    report_count = conn.execute("SELECT count(*) FROM generated_reports").fetchone()[0] or 0
+    data = []
+    with open(jsonl_path, 'r', encoding='utf-8') as f:
+        for line in f:
+            if line.strip():
+                data.append(json.loads(line))
+    return pd.DataFrame(data)
+
+def load_dashboard_data():
+    # Mocking dashboard analytics since DB is removed
+    queries = pd.DataFrame([
+        {"Topic": "Insolvency", "Count": 45},
+        {"Topic": "Contract Breach", "Count": 32},
+        {"Topic": "Trusts", "Count": 18},
+        {"Topic": "Defamation", "Count": 12},
+        {"Topic": "Employment", "Count": 8}
+    ]).set_index("Topic")
     
-    conn.close()
-    return queries.set_index("Topic"), reports, recent_query_count, report_count
+    reports = pd.DataFrame([
+        {"Report Title": "Q1 Insolvency Trends", "Original Query": "bankruptcy", "Date Created": "2026-02-20"},
+        {"Report Title": "Breach of Contract Analysis", "Original Query": "contract", "Date Created": "2026-02-18"}
+    ])
+    reports["Actions"] = "View & Export"
+    
+    recent_query_count = 115
+    report_count = 2
+    
+    return queries, reports, recent_query_count, report_count
 
 st.title("⚖️ Singapore Court Case Analytics")
 st.caption("Data source: LawNet OpenLaw (Scraped locally)")
@@ -43,28 +57,15 @@ with st.sidebar.expander("Add New Cases (Scraper)", expanded=False):
                 progress_bar = st.progress(0)
                 status_text = st.empty()
                 
-                async def run_scraper(urls):
+                def run_scraper_subprocess(urls):
                     for i, url in enumerate(urls):
                         status_text.text(f"Scraping {i+1}/{len(urls)}: {url}...")
-                        # Call the existing pipeline logic
-                        await process_case(url, db_name="data/cases.db")
+                        # Run pipeline.py directly via subprocess
+                        subprocess.run([sys.executable, "pipeline.py", url, "--force"])
                         progress_bar.progress((i + 1) / len(urls))
                     status_text.success("Scraping completed!")
-                    await asyncio.sleep(1) # Brief pause to show success
                 
-                # Run the async loop
-                try:
-                    loop = asyncio.get_event_loop()
-                except RuntimeError:
-                    loop = asyncio.new_event_loop()
-                    asyncio.set_event_loop(loop)
-                
-                # Streamlit runs in a separate thread usually, but asyncio.run might conflict with existing loop?
-                # Safer to use new event loop policy or just try run
-                # Given app.py imports asyncio, let's stick to simple run or loop management
-                import nest_asyncio
-                nest_asyncio.apply()
-                asyncio.run(run_scraper(urls))
+                run_scraper_subprocess(urls)
                 
                 st.rerun() # Refresh data
             else:
@@ -79,29 +80,41 @@ try:
     if df.empty:
         st.warning("No data found in database. Run scraper first.")
     else:
-        # Convert date column to datetime
+        # 1. Convert date column robustly
+        if "decision_date" not in df.columns:
+            df["decision_date"] = None
+        
         df["decision_date_dt"] = pd.to_datetime(df["decision_date"], errors='coerce')
         
         # Sidebar Filters
         st.sidebar.header("Filter Options")
         
-        # 1. Date Range Slider
-        if not df["decision_date_dt"].isnull().all():
-            min_date = df["decision_date_dt"].min().date()
-            max_date = df["decision_date_dt"].max().date()
+        # 2. Date Range Slider
+        valid_dates = df["decision_date_dt"].dropna()
+        if not valid_dates.empty:
+            min_date = valid_dates.min().date()
+            max_date = valid_dates.max().date()
+            
+            # Streamlit range sliders crash if min_value == max_value.
+            # If we only have 1 case (or all cases are the same day), add a 1 day buffer to max_date
+            import datetime
+            if min_date == max_date:
+                max_date = max_date + datetime.timedelta(days=1)
             
             # Default to full range
             start_date, end_date = st.sidebar.slider(
                 "Select Date Range",
                 min_value=min_date,
                 max_value=max_date,
-                value=(min_date, max_date)
+                value=(min_date, max_date),
+                format="YYYY-MM-DD"
             )
             
             # Filter by Date
             df_filtered = df[
-                (df["decision_date_dt"].dt.date >= start_date) & 
-                (df["decision_date_dt"].dt.date <= end_date)
+                df["decision_date_dt"].isna() | # Keep rows with missing dates in the filter view
+                ((df["decision_date_dt"].dt.date >= start_date) & 
+                 (df["decision_date_dt"].dt.date <= end_date))
             ]
         else:
             df_filtered = df
@@ -117,7 +130,7 @@ try:
         st.title("Singapore Court Case Analytics")
         
         # --- Analytics Tabs ---
-        tab0, tab1, tab2, tab3 = st.tabs(["📊 Research Dashboard", "📈 Cluster Analytics", "📄 Single Case View", "🔌 API Documentation"])
+        tab0, tab1, tab_people, tab2 = st.tabs(["📊 Research Dashboard", "📈 Cluster Analytics", "👨‍⚖️ People Analytics", "🔌 API Documentation"])
 
         # --- TAB 0: Research Dashboard---
         with tab0:
@@ -135,10 +148,10 @@ try:
             
             # 1. Total Cases
             total_cases = len(df)
-            m1.metric("Total Cases Analyzed", f"{total_cases:,}", delta="+12% from last month")
+            m1.metric("Total Cases Analyzed", f"{total_cases:,}", delta="+1 locally")
             
             # 2. Reports Generated
-            m2.metric("Reports Generated", f"{report_stats}", delta="+8 this month")
+            m2.metric("JSONL File Size", f"{os.path.getsize('data/case_data.jsonl') // 1024} KB" if os.path.exists('data/case_data.jsonl') else "0 KB")
             
             # 3. Recent Queries
             m3.metric("Recent Queries", f"{query_stats}", "in the last 7 days")
@@ -223,22 +236,63 @@ try:
 
             st.divider()
             
-            # Bottom Row: Recent Reports Table
-            st.subheader("Recent Reports")
-            st.caption("Your latest generated reports, ready for download.")
+            # Bottom Row: Show the actual case dataset
+            st.subheader("Extracted Cases")
+            st.caption("Click any row to view full details.")
             
-            if not recent_reports.empty:
-                st.dataframe(
-                    recent_reports,
-                    width='stretch',
-                    column_config={
-                        "Actions": st.column_config.LinkColumn("Actions", display_text="View & Export")
-                    },
-                    hide_index=True
-                )
-            else:
-                st.info("No reports generated yet.")
+            # Interactive Dataframe Selection
+            df_display = df_filtered[[
+                "citation", "case_name", "decision_date", 
+                "area_of_law", "outcome", "judge_name"
+            ]].copy()
+            
+            def format_areas(x):
+                if pd.isna(x): return "N/A"
+                areas = [a.strip() for a in str(x).split(';') if a.strip()]
+                return " : ".join(areas) if areas else "N/A"
+                
+            df_display["area_of_law"] = df_display["area_of_law"].apply(format_areas)
+            
+            selection = st.dataframe(
+                df_display,
+                width='stretch',
+                hide_index=True,
+                on_select="rerun",
+                selection_mode="single-row"
+            )
+            
+            # Show Detailed Case View if a row is selected
+            if selection and selection.selection.rows:
+                selected_index = selection.selection.rows[0]
+                case = df_filtered.iloc[selected_index]
+                
+                st.divider()
+                st.subheader(f"Case Inspector: {case['citation']}")
+                
+                col1, col2 = st.columns(2)
+                with col1:
+                    st.markdown(f"**Case Name:** {case['case_name']}")
+                    st.markdown(f"**Date:** {case['decision_date']}")
+                    st.markdown(f"**Judge:** {case['judge_name']}")
+                
+                with col2:
+                    st.markdown(f"**Plaintiff:** {case['plaintiff_name']}")
+                    st.markdown(f"**Defendant:** {case['defendant_name']}")
+                    st.markdown(f"**Counsel:** {case['plaintiff_counsel']} / {case['defendant_counsel']}")
 
+                st.info(f"**Outcome:** {case['outcome']}")
+                
+                area_val = case.get('area_of_law')
+                if pd.isna(area_val):
+                    area_formatted = "N/A"
+                else:
+                    areas_list = [a.strip() for a in str(area_val).split(';') if a.strip()]
+                    area_formatted = " : ".join(areas_list) if areas_list else "N/A"
+                    
+                st.caption(f"**Area of Law:** {area_formatted}")
+                
+                with st.expander("Read Judgment Text", expanded=True):
+                    st.text(case.get("raw_judgment_text", "No text available."))
 
         # --- TAB 1: Cluster Analytics ---
         with tab1:
@@ -249,9 +303,14 @@ try:
                 
                 with col1:
                     st.write("**Cases by Area of Law**")
-                    area_counts = df_filtered["area_of_law"].value_counts()
-                    if not area_counts.empty:
-                        st.bar_chart(area_counts)
+                    if "area_of_law" in df_filtered.columns and not df_filtered["area_of_law"].empty:
+                        expanded_areas = df_filtered["area_of_law"].dropna().astype(str).str.split(';').explode().str.strip()
+                        expanded_areas = expanded_areas[expanded_areas != ""]
+                        area_counts = expanded_areas.value_counts()
+                        if not area_counts.empty:
+                            st.bar_chart(area_counts)
+                        else:
+                            st.caption("No data.")
                     else:
                         st.caption("No data.")
                     
@@ -264,60 +323,235 @@ try:
                         st.caption("No data.")
 
                 st.write("**Timeline of Cases**")
-                # Group by Month-Year
-                timeline = df_filtered.groupby([df_filtered["decision_date_dt"].dt.to_period("M")]).size()
-                if not timeline.empty:
-                    timeline.index = timeline.index.astype(str) # Flatten for chart
-                    st.line_chart(timeline)
+                # Group by Month-Year (Use 'M' to avoid ValueError)
+                if "decision_date_dt" in df_filtered.columns and not df_filtered["decision_date_dt"].isna().all():
+                    timeline = df_filtered.dropna(subset=["decision_date_dt"]).groupby([df_filtered["decision_date_dt"].dt.to_period("M")]).size()
+                    if not timeline.empty:
+                        timeline.index = timeline.index.astype(str) # Flatten for chart
+                        st.line_chart(timeline)
+                    else:
+                        st.caption("No timeline data.")
                 else:
                     st.caption("No timeline data.")
             else:
                 st.info("No cases found in this cluster/range.")
                 
-        # --- TAB 2: Single Case View ---
-        with tab2:
-            st.subheader("Detailed Case List")
-        
-            # Main Data Table
-            st.dataframe(
-                df_filtered[[
-                    "citation", "case_name", "decision_date", 
-                    "area_of_law", "outcome", "judge_name"
-                ]],
-                width='stretch'
-            )
-
-            st.divider()
-            st.subheader("Case Inspector")
+        # --- TAB PEOPLE: People Analytics ---
+        with tab_people:
+            st.subheader("People Analytics (Judges & Lawyers)")
+            st.caption("Insights into cases handled by specific judges and legal counsel based on the current filters. Click a row to view their specific cases.")
             
-            citations = df_filtered["citation"].unique().tolist()
-            if citations:
-                selected_citation = st.selectbox("Select Case to View", citations)
+            if not df_filtered.empty:
+                import itertools
+                def parse_lawyers_list(counsel_str):
+                    if pd.isna(counsel_str) or not str(counsel_str).strip():
+                        return []
+                    import re
+                    clean_str = re.sub(r'\(.*?\)', '', str(counsel_str))
+                    clean_str = re.sub(r'for the .*', '', clean_str, flags=re.IGNORECASE)
+                    parts = re.split(r',|\band\b', clean_str)
+                    return [p.strip() for p in parts if p.strip()]
 
-                if selected_citation:
-                    case = df_filtered[df_filtered["citation"] == selected_citation].iloc[0]
-                    
-                    col1, col2 = st.columns(2)
-                    with col1:
-                        st.markdown(f"**Case Name:** {case['case_name']}")
-                        st.markdown(f"**Date:** {case['decision_date']}")
-                        st.markdown(f"**Judge:** {case['judge_name']}")
-                    
-                    with col2:
-                        st.markdown(f"**Plaintiff:** {case['plaintiff_name']}")
-                        st.markdown(f"**Defendant:** {case['defendant_name']}")
-                        st.markdown(f"**Counsel:** {case['plaintiff_counsel']} / {case['defendant_counsel']}")
+                all_lawyers = []
+                lawyer_to_cases = {}
+                judge_to_cases = {}
+                co_counsel_pairs = []
+                lawyer_judge_pairs = []
 
-                    st.info(f"**Outcome:** {case['outcome']}")
-                    st.caption(f"**Area of Law:** {case['area_of_law']}")
+                for _, row in df_filtered.iterrows():
+                    p_counsel = parse_lawyers_list(row.get("plaintiff_counsel", ""))
+                    d_counsel = parse_lawyers_list(row.get("defendant_counsel", ""))
                     
-                    with st.expander("Read Judgment Text"):
-                        st.text(case["raw_judgment_text"])
+                    case_lawyers = list(set(p_counsel + d_counsel))
+                    all_lawyers.extend(case_lawyers)
+                    
+                    for l in case_lawyers:
+                        lawyer_to_cases.setdefault(l, []).append(row)
+                        
+                    judge = row.get("judge_name")
+                    if pd.notna(judge) and str(judge).strip():
+                        j_name = str(judge).strip()
+                        judge_to_cases.setdefault(j_name, []).append(row)
+                        for l in case_lawyers:
+                            lawyer_judge_pairs.append({"Lawyer": l, "Judge": j_name})
+                            
+                    # Co-counsel pairs (combining within plaintiff or within defendant)
+                    for pair in itertools.combinations(sorted(list(set(p_counsel))), 2):
+                        co_counsel_pairs.append({"Lawyer A": pair[0], "Lawyer B": pair[1]})
+                    for pair in itertools.combinations(sorted(list(set(d_counsel))), 2):
+                        co_counsel_pairs.append({"Lawyer A": pair[0], "Lawyer B": pair[1]})
+
+                lawyer_counts = pd.Series([l for l in all_lawyers if l]).value_counts().reset_index()
+                lawyer_counts.columns = ["Lawyer", "Case Count"]
+                
+                if "judge_name" in df_filtered.columns:
+                    judge_counts = df_filtered["judge_name"].dropna().apply(lambda x: str(x).strip()).value_counts().reset_index()
+                    judge_counts.columns = ["Judge", "Case Count"]
+                else:
+                    judge_counts = pd.DataFrame(columns=["Judge", "Case Count"])
+
+                st.markdown("### Top Practitioners")
+                col1, col2 = st.columns(2)
+                with col1:
+                    st.write("**Top Lawyers by Case Count**")
+                    if not lawyer_counts.empty:
+                        lawyer_disp = lawyer_counts.head(20)
+                        lawyer_selection = st.dataframe(lawyer_disp, hide_index=True, use_container_width=True, on_select="rerun", selection_mode="single-row")
+                    else:
+                        st.caption("No lawyer data found.")
+                        lawyer_selection = None
+                        
+                with col2:
+                    st.write("**Judges by Case Count**")
+                    if not judge_counts.empty:
+                        judge_disp = judge_counts.head(20)
+                        judge_selection = st.dataframe(judge_disp, hide_index=True, use_container_width=True, on_select="rerun", selection_mode="single-row")
+                    else:
+                        st.caption("No judge data found.")
+                        judge_selection = None
+
+                # Selection Details
+                if lawyer_selection and lawyer_selection.selection.rows:
+                    sel_idx = lawyer_selection.selection.rows[0]
+                    sel_lawyer = lawyer_disp.iloc[sel_idx]["Lawyer"]
+                    st.divider()
+                    st.subheader(f"Cases Handled by: {sel_lawyer}")
+                    cases_for_lawyer = pd.DataFrame(lawyer_to_cases.get(sel_lawyer, []))
+                    if not cases_for_lawyer.empty:
+                        # Format the Data Table
+                        cases_disp_l = cases_for_lawyer[["citation", "case_name", "decision_date", "area_of_law", "outcome"]].copy()
+                        if "area_of_law" in cases_disp_l.columns:
+                            cases_disp_l["area_of_law"] = cases_disp_l["area_of_law"].apply(lambda x: str(x).replace(" : ", "; ") if pd.notnull(x) else x)
+                        
+                        # 1. Provide High-Level Charts
+                        lc1, lc2 = st.columns(2)
+                        with lc1:
+                            st.write(f"**{sel_lawyer}'s Areas of Law**")
+                            if "area_of_law" in cases_for_lawyer.columns:
+                                expanded_law = cases_for_lawyer["area_of_law"].dropna().astype(str).str.split(';').explode().str.strip()
+                                expanded_law = expanded_law[(expanded_law != "") & (expanded_law != "N/A")]
+                                if not expanded_law.empty:
+                                    st.bar_chart(expanded_law.value_counts())
+                                else:
+                                    st.caption("No area of law data.")
+                        with lc2:
+                            st.write(f"**{sel_lawyer}'s Timeline**")
+                            if "decision_date_dt" in cases_for_lawyer.columns and not cases_for_lawyer["decision_date_dt"].isna().all():
+                                timeline = cases_for_lawyer.dropna(subset=["decision_date_dt"])
+                                timeline_grouped = timeline.groupby(timeline["decision_date_dt"].dt.to_period("M")).size().reset_index(name="Case Count")
+                                timeline_grouped["decision_date_dt"] = timeline_grouped["decision_date_dt"].dt.to_timestamp()
+                                
+                                if not timeline_grouped.empty:
+                                    import plotly.express as px
+                                    fig = px.line(timeline_grouped, x="decision_date_dt", y="Case Count", markers=True, color_discrete_sequence=["#4CAF50"])
+                                    fig.update_layout(xaxis_title="Timeline", yaxis_title="Cases", margin=dict(l=0, r=0, t=10, b=0))
+                                    st.plotly_chart(fig, use_container_width=True)
+                                else:
+                                    st.caption("No timeline data.")
+                            else:
+                                st.caption("No timeline data.")
+                                
+                        # 2. Provide the Data Table
+                        st.write(f"**Case List ({len(cases_disp_l)} Cases)**")
+                        st.dataframe(cases_disp_l, hide_index=True, use_container_width=True)
+
+                if judge_selection and judge_selection.selection.rows:
+                    sel_idx = judge_selection.selection.rows[0]
+                    sel_judge = judge_disp.iloc[sel_idx]["Judge"]
+                    st.divider()
+                    st.subheader(f"Cases Heard by: {sel_judge}")
+                    cases_for_judge = pd.DataFrame(judge_to_cases.get(sel_judge, []))
+                    if not cases_for_judge.empty:
+                        # Format the Data Table
+                        cases_disp_j = cases_for_judge[["citation", "case_name", "decision_date", "area_of_law", "outcome"]].copy()
+                        if "area_of_law" in cases_disp_j.columns:
+                            cases_disp_j["area_of_law"] = cases_disp_j["area_of_law"].apply(lambda x: str(x).replace(" : ", "; ") if pd.notnull(x) else x)
+                        
+                         # 1. Provide High-Level Charts
+                        jc1, jc2 = st.columns(2)
+                        with jc1:
+                            st.write(f"**{sel_judge}'s Areas of Law**")
+                            if "area_of_law" in cases_for_judge.columns:
+                                expanded_law = cases_for_judge["area_of_law"].dropna().astype(str).str.split(';').explode().str.strip()
+                                expanded_law = expanded_law[(expanded_law != "") & (expanded_law != "N/A")]
+                                if not expanded_law.empty:
+                                    st.bar_chart(expanded_law.value_counts())
+                                else:
+                                    st.caption("No area of law data.")
+                        with jc2:
+                            st.write(f"**{sel_judge}'s Timeline**")
+                            if "decision_date_dt" in cases_for_judge.columns and not cases_for_judge["decision_date_dt"].isna().all():
+                                timeline = cases_for_judge.dropna(subset=["decision_date_dt"])
+                                timeline_grouped = timeline.groupby(timeline["decision_date_dt"].dt.to_period("M")).size().reset_index(name="Case Count")
+                                timeline_grouped["decision_date_dt"] = timeline_grouped["decision_date_dt"].dt.to_timestamp()
+                                
+                                if not timeline_grouped.empty:
+                                    import plotly.express as px
+                                    fig = px.line(timeline_grouped, x="decision_date_dt", y="Case Count", markers=True, color_discrete_sequence=["#FF9800"])
+                                    fig.update_layout(xaxis_title="Timeline", yaxis_title="Cases", margin=dict(l=0, r=0, t=10, b=0))
+                                    st.plotly_chart(fig, use_container_width=True)
+                                else:
+                                    st.caption("No timeline data.")
+                            else:
+                                st.caption("No timeline data.")
+                                
+                        # 2. Provide the Data Table
+                        st.write(f"**Case List ({len(cases_disp_j)} Cases)**")
+                        st.dataframe(cases_disp_j, hide_index=True, use_container_width=True)
+
+                st.divider()
+                st.markdown("### Entity Relationships")
+                rel_col1, rel_col2 = st.columns(2)
+                with rel_col1:
+                    st.write("**Lawyers (Co-Counsel Network)**")
+                    st.caption("Select a lawyer to view their co-counsels.")
+                    if co_counsel_pairs:
+                        co_counsel_df = pd.DataFrame(co_counsel_pairs)
+                        all_co_lawyers = list(co_counsel_df["Lawyer A"]) + list(co_counsel_df["Lawyer B"])
+                        co_lawyer_counts = pd.Series(all_co_lawyers).value_counts().reset_index()
+                        co_lawyer_counts.columns = ["Lawyer", "Total Collaborations"]
+                        co_counsel_selection = st.dataframe(co_lawyer_counts.head(20), hide_index=True, use_container_width=True, on_select="rerun", selection_mode="single-row")
+                    else:
+                        st.caption("No co-counsel data found.")
+                with rel_col2:
+                    st.write("**Judges (Lawyer Appearances)**")
+                    st.caption("Select a judge to view lawyers who appeared before them.")
+                    if lawyer_judge_pairs:
+                        lj_df = pd.DataFrame(lawyer_judge_pairs)
+                        lj_unique_judges = lj_df["Judge"].value_counts().reset_index()
+                        lj_unique_judges.columns = ["Judge", "Total Appearances Heard"]
+                        lawyer_judge_selection = st.dataframe(lj_unique_judges.head(20), hide_index=True, use_container_width=True, on_select="rerun", selection_mode="single-row")
+                    else:
+                        st.caption("No lawyer-judge data found.")
+
+                if co_counsel_pairs and co_counsel_selection and co_counsel_selection.selection.rows:
+                    sel_idx = co_counsel_selection.selection.rows[0]
+                    sel_lawyer = co_lawyer_counts.iloc[sel_idx]["Lawyer"]
+                    st.divider()
+                    st.subheader(f"Co-Counsels for {sel_lawyer}")
+                    mask_a = co_counsel_df["Lawyer A"] == sel_lawyer
+                    mask_b = co_counsel_df["Lawyer B"] == sel_lawyer
+                    collaborations = pd.concat([
+                        co_counsel_df[mask_a]["Lawyer B"],
+                        co_counsel_df[mask_b]["Lawyer A"]
+                    ]).value_counts().reset_index()
+                    collaborations.columns = ["Co-Counsel", "Collaborations"]
+                    st.dataframe(collaborations, hide_index=True, use_container_width=True)
+
+                if lawyer_judge_pairs and lawyer_judge_selection and lawyer_judge_selection.selection.rows:
+                    sel_idx = lawyer_judge_selection.selection.rows[0]
+                    sel_judge = lj_unique_judges.iloc[sel_idx]["Judge"]
+                    st.divider()
+                    st.subheader(f"Lawyers Appearing Before {sel_judge}")
+                    mask_j = lj_df["Judge"] == sel_judge
+                    appearances = lj_df[mask_j]["Lawyer"].value_counts().reset_index()
+                    appearances.columns = ["Lawyer", "Appearances"]
+                    st.dataframe(appearances, hide_index=True, use_container_width=True)
             else:
-                st.warning("No cases available to inspect.")
+                st.info("No cases found in this cluster/range.")
 
-        # --- TAB 3: API Documentation ---
-        with tab3:
+        # --- TAB 2: API Documentation ---
+        with tab2:
             st.markdown("## System API Reference")
             st.caption("The application exposes a REST API via `FastAPI` in `api.py`. You can use this to integrate with other systems.")
             
@@ -327,7 +561,7 @@ try:
 
             st.info("""
             **Architecture Note**: 
-            - **Data**: Stored in **Supabase** (Cloud).
+            - **Data**: Stored in **JSONL** locally (`data/case_data.jsonl`).
             - **API Server**: Currently running **locally** (`localhost`). 
             If you deploy this app (e.g. to Vercel/Render), update the Base URL below.
             """)
@@ -391,9 +625,23 @@ response = requests.post("{base_url}/cases/scrape", json=payload)
 print(response.json())
                     """, language="python")
 
-            # --- Endpoint 3: Health Check ---
+            # --- Endpoint 3: Lawyers ---
             st.divider()
-            st.subheader("3. Health Check")
+            st.subheader("3. List Lawyers")
+            st.markdown("`GET /lawyers`")
+            st.markdown("Retrieves statistics on unique lawyers and their case counts.")
+            st.code('curl -X GET "http://localhost:8000/lawyers?limit=10"', language="bash")
+
+            # --- Endpoint 4: Judges ---
+            st.divider()
+            st.subheader("4. List Judges")
+            st.markdown("`GET /judges`")
+            st.markdown("Retrieves statistics on unique judges and their case counts.")
+            st.code('curl -X GET "http://localhost:8000/judges?limit=10"', language="bash")
+
+            # --- Endpoint 5: Health Check ---
+            st.divider()
+            st.subheader("5. Health Check")
             st.markdown("`GET /`")
             st.markdown("Simple health check to verify API status.")
             st.code('curl -X GET "http://localhost:8000/"', language="bash")
@@ -403,5 +651,5 @@ print(response.json())
             st.markdown("Once the API is running, visit `http://localhost:8000/docs` for the interactive Swagger UI.")
 
 except Exception as e:
-    st.error(f"Database Error: {e}")
-    st.info("Check your `.env` configuration or run `python seed_cases.py` (if local) to initialize.")
+    st.error(f"Error loading dashboard: {e}")
+    st.info("Check if data/case_data.jsonl format is valid.")
