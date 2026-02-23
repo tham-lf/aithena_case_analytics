@@ -561,9 +561,9 @@ try:
 
             st.info("""
             **Architecture Note**: 
-            - **Data**: Stored in **JSONL** locally (`data/case_data.jsonl`).
+            - **Data**: Stored in **JSONL** locally (`data/case_data.jsonl`). All endpoints use this real, local dataset.
             - **API Server**: Currently running **locally** (`localhost`). 
-            If you deploy this app (e.g. to Vercel/Render), update the Base URL below.
+            - **Implementation**: The API logic is centered in `api.py`, and scraping tasks utilize `pipeline.py`.
             """)
             
             base_url = st.text_input("API Base URL", value="http://localhost:8000")
@@ -573,7 +573,12 @@ try:
             st.markdown("`GET /cases`")
             st.markdown("Retrieves a paginated list of analyzed cases from the database.")
             
-            with st.expander("Usage Example"):
+            with st.expander("Implementation Details & Usage"):
+                st.markdown("""
+                **Files**: `api.py`  
+                **Data Source**: `data/case_data.jsonl` (Real Data)  
+                **Logic**: Reads the local JSONL file line by line, sorts by newest first, and returns a paginated list of cases.
+                """)
                 tab_curl, tab_py = st.tabs(["cURL", "Python"])
                 
                 with tab_curl:
@@ -597,7 +602,12 @@ print(response.json())
             st.markdown("`POST /cases/scrape`")
             st.markdown("Triggers a background job to scrape and process a list of LawNet URLs.")
             
-            with st.expander("Usage Example"):
+            with st.expander("Implementation Details & Usage"):
+                st.markdown("""
+                **Files**: `api.py`, `pipeline.py`  
+                **Data Source**: LawNet (Scraping)  
+                **Logic**: Uses FastAPI's `BackgroundTasks` to trigger `process_case` from `pipeline.py` without blocking the API response.
+                """)
                 tab_curl, tab_py = st.tabs(["cURL", "Python"])
                 
                 with tab_curl:
@@ -628,16 +638,16 @@ print(response.json())
             # --- Endpoint 3: Lawyers ---
             st.divider()
             st.subheader("3. List Lawyers")
-            st.markdown("`GET /lawyers`")
-            st.markdown("Retrieves statistics on unique lawyers and their case counts.")
-            st.code('curl -X GET "http://localhost:8000/lawyers?limit=10"', language="bash")
-
-            # --- Endpoint 4: Judges ---
-            st.divider()
-            st.subheader("4. List Judges")
-            st.markdown("`GET /judges`")
-            st.markdown("Retrieves statistics on unique judges and their case counts.")
-            st.code('curl -X GET "http://localhost:8000/judges?limit=10"', language="bash")
+            st.markdown("`GET /lawyers` / `GET /judges`")
+            st.markdown("Retrieves statistics on unique lawyers or judges and their case counts.")
+            with st.expander("Implementation Details & Usage"):
+                 st.markdown("""
+                **Files**: `api.py`  
+                **Data Source**: `data/case_data.jsonl` (Real Data)  
+                **Logic**: For lawyers, it parses counsel strings using regex to extract individual names (stripping firm names and roles). For judges, it counts occurrences of `judge_name`.
+                """)
+                 st.code('curl -X GET "http://localhost:8000/lawyers?limit=10"', language="bash")
+                 st.code('curl -X GET "http://localhost:8000/judges?limit=10"', language="bash")
 
             # --- Endpoint 5: Health Check ---
             st.divider()
