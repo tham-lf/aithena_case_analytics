@@ -1,0 +1,13 @@
+version: '3.8'
+
+services:
+  case-analytics:
+    build: .
+    ports:
+      - "8501:8501" # Streamlit
+      - "8000:8000" # FastAPI
+    volumes:
+      - ./data:/app/data
+    env_file:
+      - .env
+    restart: unless-stopped
