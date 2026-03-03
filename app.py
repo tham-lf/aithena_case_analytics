@@ -566,7 +566,12 @@ try:
             - **Implementation**: The API logic is centered in `api.py`, and scraping tasks utilize `pipeline.py`.
             """)
             
-            base_url = st.text_input("API Base URL", value="http://localhost:8000")
+            # Use Railway public URL if available, otherwise default to localhost
+            default_api_url = os.getenv("RAILWAY_PUBLIC_DOMAIN", "localhost:8000")
+            if not default_api_url.startswith("http"):
+                default_api_url = f"http://{default_api_url}"
+                
+            base_url = st.text_input("API Base URL", value=default_api_url)
             
             # --- Endpoint 1: GET /cases ---
             st.subheader("1. List Cases")
